@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Face Detection Test</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: #1a1a2e;
+            color: white;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+        }
+
+        #status {
+            padding: 15px;
+            background: #16213e;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+
+        .video-container {
+            position: relative;
+            background: black;
+            border-radius: 12px;
+            overflow: hidden;
+        }
+
+        video {
+            width: 100%;
+            transform: scaleX(-1);
+        }
+
+        canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            transform: scaleX(-1);
+        }
+
+        .error {
+            color: #ff6b6b;
+        }
+
+        .success {
+            color: #51cf66;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <h1>🎯 Face Detection Test</h1>
+        <div id="status">Status: Initializing...</div>
+
+        <div class="video-container">
+            <video id="video" autoplay playsinline></video>
+            <canvas id="canvas"></canvas>
+        </div>
+
+        <div id="debug" style="margin-top: 20px; font-family: monospace; font-size: 12px;"></div>
+    </div>
+
+    <!-- TensorFlow.js and FaceMesh -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-converter"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/face-landmarks-detection"></script>
+
+    <script>
+        const statusEl = document.getElementById('status');
+        const debugEl = document.getElementById('debug');
+        const video = document.getElementById('video');
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+
+        let detector = null;
+        let isActive = false;
+
+        function updateStatus(message, isError = false) {
+            statusEl.innerHTML = `Status: <span class="${isError ? 'error' : 'success'}">${message}</span>`;
+            console.log(message);
+        }
+
+        function addDebug(message) {
+            const time = new Date().toLocaleTimeString();
+            debugEl.innerHTML += `[${time}] ${message}<br>`;
+            debugEl.scrollTop = debugEl.scrollHeight;
+        }
+
+        async function init() {
+            try {
+                addDebug('Starting initialization...');
+
+                // Check if TensorFlow.js is loaded
+                if (typeof tf === 'undefined') {
+                    throw new Error('TensorFlow.js not loaded');
+                }
+                addDebug('✓ TensorFlow.js loaded');
+
+                // Check if face detection is available
+                if (typeof faceLandmarksDetection === 'undefined') {
+                    throw new Error('Face Landmarks Detection not loaded');
+                }
+                addDebug('✓ Face Landmarks Detection loaded');
+
+                updateStatus('Loading model...');
+
+                // Create detector
+                const model = faceLandmarksDetection.SupportedModels.MediaPipeFaceMesh;
+                const detectorConfig = {
+                    runtime: 'tfjs',
+                    refineLandmarks: true,
+                    maxFaces: 1
+                };
+
+                addDebug('Creating detector...');
+                detector = await faceLandmarksDetection.createDetector(model, detectorConfig);
+                addDebug('✓ Detector created');
+
+                updateStatus('Starting camera...');
+
+                // Get camera
+                addDebug('Requesting camera access...');
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        width: 640,
+                        height: 480,
+                        facingMode: 'user'
+                    },
+                    audio: false
+                });
+
+                video.srcObject = stream;
+                addDebug('✓ Camera started');
+
+                // Wait for video to be ready
+                await new Promise((resolve) => {
+                    video.onloadedmetadata = () => {
+                        addDebug('✓ Video metadata loaded');
+                        resolve();
+                    };
+                });
+
+                updateStatus('Detecting faces...');
+                isActive = true;
+
+                // Start detection
+                detectFaces();
+
+            } catch (error) {
+                updateStatus('Error: ' + error.message, true);
+                addDebug('❌ Error: ' + error.message);
+                console.error(error);
+            }
+        }
+
+        async function detectFaces() {
+            if (!isActive || !detector) return;
+
+            try {
+                // Set canvas size
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+
+                // Detect faces
+                const faces = await detector.estimateFaces(video, {
+                    flipHorizontal: false
+                });
+
+                // Clear canvas
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+                if (faces.length > 0) {
+                    updateStatus(`Face detected! (${faces.length} face${faces.length > 1 ? 's' : ''})`);
+
+                    // Draw landmarks
+                    faces.forEach(face => {
+                        face.keypoints.forEach((point, index) => {
+                            if (index % 10 === 0) {
+                                ctx.beginPath();
+                                ctx.arc(point.x, point.y, 2, 0, 2 * Math.PI);
+                                ctx.fillStyle = 'rgba(139, 92, 246, 0.8)';
+                                ctx.fill();
+                            }
+                        });
+                    });
+                } else {
+                    updateStatus('No face detected - move into view');
+                }
+
+            } catch (error) {
+                addDebug('❌ Detection error: ' + error.message);
+                console.error(error);
+            }
+
+            // Continue loop
+            requestAnimationFrame(detectFaces);
+        }
+
+        // Start when page loads
+        window.addEventListener('load', () => {
+            addDebug('Page loaded, starting in 1 second...');
+            setTimeout(init, 1000);
+        });
+    </script>
+</body>
+
+</html>

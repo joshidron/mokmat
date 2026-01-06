@@ -1,0 +1,23 @@
+# Gesture Recognition System Requirements
+# Install with: pip install -r gesture_requirements.txt
+
+# Core Computer Vision
+opencv-python>=4.8.0
+opencv-contrib-python>=4.8.0
+
+# MediaPipe for gesture detection
+mediapipe>=0.10.0
+
+# Numerical computing
+numpy>=1.24.0
+
+# Web framework for API
+Flask>=2.3.0
+flask-cors>=4.0.0
+
+# Additional utilities
+Pillow>=10.0.0
+scipy>=1.11.0
+
+# Optional: For better performance
+# tensorflow>=2.13.0  # Uncomment if you want TensorFlow backend

@@ -1,0 +1,1074 @@
+"""
+Enhanced Interview System with Authentication and Limits
+Features:
+- User login/registration
+- Interview limits (2 per 24h, 5 total max)
+- Tab switching detection
+- Dynamic report generation
+"""
+
+from flask import Flask, request, jsonify, render_template, session, redirect, url_for
+from flask_cors import CORS
+from authlib.integrations.flask_client import OAuth
+import os
+import sqlite3
+from datetime import datetime, timedelta
+from train_model import InterviewModel
+import json
+import hashlib
+import secrets
+from flask import send_file
+from report_generator import InterviewReportGenerator
+import io
+
+app = Flask(__name__, static_folder='static', template_folder='templates')
+app.secret_key = secrets.token_hex(32)
+CORS(app)
+
+# Google OAuth Configuration
+# IMPORTANT: Replace these with your actual Google OAuth credentials
+# Get them from: https://console.cloud.google.com/apis/credentials
+app.config['GOOGLE_CLIENT_ID'] = os.environ.get('GOOGLE_CLIENT_ID', 'YOUR_GOOGLE_CLIENT_ID')
+app.config['GOOGLE_CLIENT_SECRET'] = os.environ.get('GOOGLE_CLIENT_SECRET', 'YOUR_GOOGLE_CLIENT_SECRET')
+
+# Initialize OAuth
+oauth = OAuth(app)
+google = oauth.register(
+    name='google',
+    client_id=app.config['GOOGLE_CLIENT_ID'],
+    client_secret=app.config['GOOGLE_CLIENT_SECRET'],
+    server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
+    client_kwargs={
+        'scope': 'openid email profile'
+    }
+)
+
+# Database setup
+DB_PATH = 'interview_system.db'
+
+def init_db():
+    """Initialize the database"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    # Users table (updated to support OAuth)
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT,
+            google_id TEXT UNIQUE,
+            profile_picture TEXT,
+            auth_provider TEXT DEFAULT 'local',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            total_interviews INTEGER DEFAULT 0
+        )
+    ''')
+    
+    # Interview sessions table (enhanced with tracking fields)
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS interview_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            session_id TEXT UNIQUE NOT NULL,
+            role TEXT NOT NULL,
+            category TEXT NOT NULL,
+            difficulty TEXT,
+            total_questions INTEGER,
+            completed BOOLEAN DEFAULT 0,
+            tab_switches INTEGER DEFAULT 0,
+            posture_violations INTEGER DEFAULT 0,
+            eye_tracking_score REAL DEFAULT 0.0,
+            focus_percentage REAL DEFAULT 0.0,
+            terminated BOOLEAN DEFAULT 0,
+            terminated_reason TEXT,
+            warning_count INTEGER DEFAULT 0,
+            start_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            end_time TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    ''')
+    
+    # Answers table
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS answers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            question TEXT NOT NULL,
+            answer TEXT NOT NULL,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (session_id) REFERENCES interview_sessions(session_id)
+        )
+    ''')
+    
+    # Tracking events table (NEW)
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS tracking_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            details TEXT,
+            FOREIGN KEY (session_id) REFERENCES interview_sessions(session_id)
+        )
+    ''')
+    
+    # User violations table (NEW)
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS user_violations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            violation_type TEXT NOT NULL,
+            violation_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            ban_until TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+# Initialize database
+init_db()
+
+# Initialize model
+model = InterviewModel()
+try:
+    model.load_model('model')
+    print("[OK] Model loaded successfully!")
+except Exception as e:
+    print("[WARNING] Model not found. Please run 'python train_model.py' first.")
+    print(f"   Error: {e}")
+
+# Store active interview sessions
+interview_sessions = {}
+
+def hash_password(password):
+    """Hash a password for storing"""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def verify_password(stored_hash, password):
+    """Verify a stored password against one provided by user"""
+    return stored_hash == hash_password(password)
+
+def get_user_interviews_last_24h(user_id):
+    """Get number of interviews in last 24 hours"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    yesterday = datetime.now() - timedelta(hours=24)
+    c.execute('''
+        SELECT COUNT(*) FROM interview_sessions 
+        WHERE user_id = ? AND start_time > ?
+    ''', (user_id, yesterday))
+    
+    count = c.fetchone()[0]
+    conn.close()
+    return count
+
+def get_user_total_interviews(user_id):
+    """Get total number of interviews for user"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    c.execute('SELECT total_interviews FROM users WHERE id = ?', (user_id,))
+    result = c.fetchone()
+    conn.close()
+    
+    return result[0] if result else 0
+
+def is_user_banned(user_id):
+    """Check if user is currently banned"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    c.execute('''
+        SELECT ban_until FROM user_violations 
+        WHERE user_id = ? AND ban_until > ? 
+        ORDER BY ban_until DESC LIMIT 1
+    ''', (user_id, datetime.now()))
+    
+    result = c.fetchone()
+    conn.close()
+    
+    if result:
+        return {
+            'is_banned': True,
+            'ban_until': result[0],
+            'reason': 'Multiple violations detected'
+        }
+    return {'is_banned': False}
+
+def can_start_interview(user_id):
+    """Check if user can start a new interview"""
+    # Check if banned
+    ban_status = is_user_banned(user_id)
+    if ban_status['is_banned']:
+        return {
+            'can_start': False,
+            'reason': 'banned',
+            'ban_until': ban_status['ban_until'],
+            'interviews_last_24h': 0,
+            'total_interviews': 0,
+            'remaining_24h': 0,
+            'remaining_total': 0
+        }
+    
+    last_24h = get_user_interviews_last_24h(user_id)
+    total = get_user_total_interviews(user_id)
+    
+    return {
+        'can_start': last_24h < 2 and total < 5,
+        'interviews_last_24h': last_24h,
+        'total_interviews': total,
+        'remaining_24h': max(0, 2 - last_24h),
+        'remaining_total': max(0, 5 - total)
+    }
+
+def terminate_interview(session_id, reason):
+    """Terminate an interview session"""
+    if session_id in interview_sessions:
+        sess = interview_sessions[session_id]
+        sess['terminated'] = True
+        sess['terminated_reason'] = reason
+        
+        # Update database
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('''
+            UPDATE interview_sessions 
+            SET terminated = 1, terminated_reason = ?, end_time = ?,
+                tab_switches = ?, warning_count = ?
+            WHERE session_id = ?
+        ''', (reason, datetime.now(), sess.get('tab_switches', 0), 
+              sess.get('warning_count', 0), session_id))
+        conn.commit()
+        conn.close()
+
+
+@app.route('/')
+def index():
+    """Main page - redirect to login if not authenticated"""
+    if 'user_id' not in session:
+        return redirect(url_for('login_page'))
+    return render_template('enhanced_interview.html')
+
+@app.route('/login')
+def login_page():
+    """Enhanced login page with Google Sign-In"""
+    return render_template('login_enhanced.html')
+
+@app.route('/register')
+def register_page():
+    """Enhanced register page with Google Sign-Up"""
+    return render_template('register_enhanced.html')
+
+@app.route('/api/google-auth', methods=['POST'])
+def google_auth():
+    """Handle Google authentication (login/register)"""
+    data = request.json
+    uid = data.get('uid')
+    email = data.get('email')
+    display_name = data.get('displayName')
+    photo_url = data.get('photoURL')
+    email_verified = data.get('emailVerified', False)
+    
+    if not uid or not email:
+        return jsonify({'error': 'Invalid Google authentication data'}), 400
+    
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        
+        # Check if user exists with this Google UID
+        c.execute('SELECT id, username FROM users WHERE google_id = ?', (uid,))
+        user = c.fetchone()
+        
+        if user:
+            # User exists, log them in
+            user_id, username = user
+            session['user_id'] = user_id
+            session['username'] = username
+            session['auth_provider'] = 'google'
+            
+            conn.close()
+            
+            return jsonify({
+                'success': True,
+                'message': 'Login successful',
+                'user': {'id': user_id, 'username': username}
+            })
+        else:
+            # Check if email already exists
+            c.execute('SELECT id, username FROM users WHERE email = ?', (email,))
+            existing = c.fetchone()
+            
+            if existing:
+                # Link Google account to existing user
+                user_id, username = existing
+                c.execute('''
+                    UPDATE users 
+                    SET google_id = ?, profile_picture = ?, auth_provider = 'google'
+                    WHERE id = ?
+                ''', (uid, photo_url, user_id))
+            else:
+                # Create new user
+                # Generate username from display name or email
+                if display_name:
+                    base_username = display_name.replace(' ', '_').lower()
+                else:
+                    base_username = email.split('@')[0]
+                
+                username = base_username
+                counter = 1
+                while True:
+                    c.execute('SELECT id FROM users WHERE username = ?', (username,))
+                    if not c.fetchone():
+                        break
+                    username = f"{base_username}_{counter}"
+                    counter += 1
+                
+                c.execute('''
+                    INSERT INTO users (username, email, google_id, profile_picture, auth_provider)
+                    VALUES (?, ?, ?, ?, 'google')
+                ''', (username, email, uid, photo_url))
+                user_id = c.lastrowid
+            
+            conn.commit()
+            conn.close()
+            
+            # Set session
+            session['user_id'] = user_id
+            session['username'] = username
+            session['auth_provider'] = 'google'
+            
+            return jsonify({
+                'success': True,
+                'message': 'Registration/Login successful',
+                'user': {'id': user_id, 'username': username}
+            })
+            
+    except Exception as e:
+        print(f"Google auth error: {e}")
+        return jsonify({'error': 'Authentication failed'}), 500
+
+
+@app.route('/api/register', methods=['POST'])
+def register():
+    """Register a new user"""
+    data = request.json
+    username = data.get('username', '').strip()
+    email = data.get('email', '').strip()
+    password = data.get('password', '')
+    
+    if not username or not email or not password:
+        return jsonify({'error': 'All fields are required'}), 400
+    
+    if len(password) < 6:
+        return jsonify({'error': 'Password must be at least 6 characters'}), 400
+    
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        
+        password_hash = hash_password(password)
+        c.execute('''
+            INSERT INTO users (username, email, password_hash)
+            VALUES (?, ?, ?)
+        ''', (username, email, password_hash))
+        
+        conn.commit()
+        user_id = c.lastrowid
+        conn.close()
+        
+        session['user_id'] = user_id
+        session['username'] = username
+        
+        return jsonify({
+            'success': True,
+            'message': 'Registration successful',
+            'user': {'id': user_id, 'username': username}
+        })
+        
+    except sqlite3.IntegrityError:
+        return jsonify({'error': 'Username or email already exists'}), 400
+
+@app.route('/api/login', methods=['POST'])
+def login():
+    """Login user"""
+    data = request.json
+    username = data.get('username', '').strip()
+    password = data.get('password', '')
+    
+    if not username or not password:
+        return jsonify({'error': 'Username and password required'}), 400
+    
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    c.execute('SELECT id, username, password_hash FROM users WHERE username = ?', (username,))
+    user = c.fetchone()
+    conn.close()
+    
+    if not user or not verify_password(user[2], password):
+        return jsonify({'error': 'Invalid username or password'}), 401
+    
+    session['user_id'] = user[0]
+    session['username'] = user[1]
+    
+    return jsonify({
+        'success': True,
+        'message': 'Login successful',
+        'user': {'id': user[0], 'username': user[1]}
+    })
+
+@app.route('/api/logout', methods=['POST'])
+def logout():
+    """Logout user"""
+    session.clear()
+    return jsonify({'success': True, 'message': 'Logged out successfully'})
+
+# Google OAuth Routes
+@app.route('/api/auth/google')
+def google_login():
+    """Initiate Google OAuth login"""
+    redirect_uri = url_for('google_callback', _external=True)
+    return google.authorize_redirect(redirect_uri)
+
+@app.route('/api/auth/google/callback')
+def google_callback():
+    """Handle Google OAuth callback"""
+    try:
+        token = google.authorize_access_token()
+        user_info = token.get('userinfo')
+        
+        if not user_info:
+            return redirect(url_for('login_page') + '?error=google_auth_failed')
+        
+        google_id = user_info.get('sub')
+        email = user_info.get('email')
+        name = user_info.get('name', email.split('@')[0])
+        picture = user_info.get('picture')
+        
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        
+        # Check if user exists with this Google ID
+        c.execute('SELECT id, username FROM users WHERE google_id = ?', (google_id,))
+        user = c.fetchone()
+        
+        if user:
+            # User exists, log them in
+            user_id, username = user
+        else:
+            # Check if email already exists
+            c.execute('SELECT id FROM users WHERE email = ?', (email,))
+            existing = c.fetchone()
+            
+            if existing:
+                # Email exists but not linked to Google - link it
+                c.execute('''
+                    UPDATE users 
+                    SET google_id = ?, profile_picture = ?, auth_provider = 'google'
+                    WHERE email = ?
+                ''', (google_id, picture, email))
+                user_id = existing[0]
+                c.execute('SELECT username FROM users WHERE id = ?', (user_id,))
+                username = c.fetchone()[0]
+            else:
+                # Create new user
+                # Generate unique username from name
+                base_username = name.replace(' ', '_').lower()
+                username = base_username
+                counter = 1
+                while True:
+                    c.execute('SELECT id FROM users WHERE username = ?', (username,))
+                    if not c.fetchone():
+                        break
+                    username = f"{base_username}_{counter}"
+                    counter += 1
+                
+                c.execute('''
+                    INSERT INTO users (username, email, google_id, profile_picture, auth_provider)
+                    VALUES (?, ?, ?, ?, 'google')
+                ''', (username, email, google_id, picture))
+                user_id = c.lastrowid
+        
+        conn.commit()
+        conn.close()
+        
+        # Set session
+        session['user_id'] = user_id
+        session['username'] = username
+        session['profile_picture'] = picture
+        session['auth_provider'] = 'google'
+        
+        return redirect('/')
+        
+    except Exception as e:
+        print(f"Google OAuth error: {e}")
+        return redirect(url_for('login_page') + '?error=google_auth_failed')
+
+@app.route('/api/check-limits', methods=['GET'])
+def check_limits():
+    """Check if user can start interview"""
+    if 'user_id' not in session:
+        return jsonify({'error': 'Not authenticated'}), 401
+    
+    limits = can_start_interview(session['user_id'])
+    return jsonify(limits)
+
+@app.route('/api/start-interview', methods=['POST'])
+def start_interview():
+    """Start a new interview session"""
+    if 'user_id' not in session:
+        return jsonify({'error': 'Not authenticated'}), 401
+    
+    user_id = session['user_id']
+    
+    # Check limits
+    limits = can_start_interview(user_id)
+    if not limits['can_start']:
+        return jsonify({
+            'error': 'Interview limit reached',
+            'limits': limits
+        }), 403
+    
+    data = request.json
+    role = data.get('role', 'Software Engineer')
+    category = data.get('category', 'Technical')
+    difficulty = data.get('difficulty', None)
+    num_questions = data.get('num_questions', 5)
+    
+    # Generate session ID
+    session_id = f"session_{user_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    
+    
+    # Get questions - with fallback if model not available
+    try:
+        questions = model.get_questions(
+            role=role,
+            category=category,
+            difficulty=difficulty,
+            num_questions=num_questions
+        )
+    except Exception as model_error:
+        print(f"[WARNING] Model error: {model_error}")
+        print("[INFO] Using fallback questions")
+        # Fallback questions
+        if category.lower() == "technical":
+            all_questions = [
+                "Explain the difference between var, let, and const in JavaScript.",
+                "What is the difference between == and === in JavaScript?",
+                "Explain the concept of closures in JavaScript.",
+                "What is the event loop in JavaScript?",
+                "Explain promises in JavaScript and how they work.",
+                "Explain the concept of REST APIs.",
+                "What is the difference between HTTP and HTTPS?",
+                "Explain the MVC architecture pattern.",
+                "What is the difference between SQL and NoSQL databases?",
+                "Explain object-oriented programming concepts."
+            ]
+        else:
+            all_questions = [
+                "Tell me about a challenging problem you solved at work.",
+                "Describe working with a difficult team member.",
+                "Tell me about a project you are proud of.",
+                "How do you handle tight deadlines and pressure?",
+                "Describe learning a new technology quickly."
+            ]
+        questions = all_questions[:min(num_questions, len(all_questions))]
+    
+    # Store in database
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    c.execute('''
+        INSERT INTO interview_sessions 
+        (user_id, session_id, role, category, difficulty, total_questions)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', (user_id, session_id, role, category, difficulty or 'mixed', len(questions)))
+    
+    # Update user's total interviews
+    c.execute('UPDATE users SET total_interviews = total_interviews + 1 WHERE id = ?', (user_id,))
+    
+    conn.commit()
+    conn.close()
+    
+    # Store session in memory
+    interview_sessions[session_id] = {
+        'user_id': user_id,
+        'role': role,
+        'category': category,
+        'difficulty': difficulty,
+        'questions': questions,
+        'current_index': 0,
+        'answers': [],
+        'tab_switches': 0,
+        'start_time': datetime.now().isoformat()
+    }
+    
+    return jsonify({
+        'session_id': session_id,
+        'total_questions': len(questions),
+        'first_question': questions[0] if questions else None
+    })
+
+@app.route('/api/get-question/<session_id>', methods=['GET'])
+def get_question(session_id):
+    """Get the current question for a session"""
+    if 'user_id' not in session:
+        return jsonify({'error': 'Not authenticated'}), 401
+    
+    if session_id not in interview_sessions:
+        return jsonify({'error': 'Session not found'}), 404
+    
+    sess = interview_sessions[session_id]
+    
+    # Verify session belongs to user
+    if sess['user_id'] != session['user_id']:
+        return jsonify({'error': 'Unauthorized'}), 403
+    
+    idx = sess['current_index']
+    
+    if idx >= len(sess['questions']):
+        return jsonify({
+            'completed': True,
+            'message': 'Interview completed!'
+        })
+    
+    return jsonify({
+        'question': sess['questions'][idx],
+        'question_number': idx + 1,
+        'total_questions': len(sess['questions']),
+        'completed': False
+    })
+
+@app.route('/api/submit-answer/<session_id>', methods=['POST'])
+def submit_answer(session_id):
+    """Submit an answer and get the next question"""
+    if 'user_id' not in session:
+        return jsonify({'error': 'Not authenticated'}), 401
+    
+    if session_id not in interview_sessions:
+        return jsonify({'error': 'Session not found'}), 404
+    
+    data = request.json
+    answer = data.get('answer', '')
+    
+    sess = interview_sessions[session_id]
+    idx = sess['current_index']
+    
+    # Store answer in database
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    c.execute('''
+        INSERT INTO answers (session_id, question, answer)
+        VALUES (?, ?, ?)
+    ''', (session_id, sess['questions'][idx], answer))
+    
+    conn.commit()
+    conn.close()
+    
+    # Store answer in memory
+    sess['answers'].append({
+        'question': sess['questions'][idx],
+        'answer': answer,
+        'timestamp': datetime.now().isoformat()
+    })
+    
+    # Move to next question
+    sess['current_index'] += 1
+    
+    # Check if interview is complete
+    if sess['current_index'] >= len(sess['questions']):
+        # Mark as completed
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('''
+            UPDATE interview_sessions 
+            SET completed = 1, end_time = ?, tab_switches = ?
+            WHERE session_id = ?
+        ''', (datetime.now(), sess['tab_switches'], session_id))
+        conn.commit()
+        conn.close()
+        
+        return jsonify({
+            'completed': True,
+            'message': 'Interview completed!',
+            'total_answered': len(sess['answers'])
+        })
+    
+    # Return next question
+    next_question = sess['questions'][sess['current_index']]
+    
+    return jsonify({
+        'completed': False,
+        'next_question': next_question,
+        'question_number': sess['current_index'] + 1,
+        'total_questions': len(sess['questions'])
+    })
+
+@app.route('/api/report-tab-switch/<session_id>', methods=['POST'])
+def report_tab_switch(session_id):
+    """Report that user switched tabs - implements 3-strike system"""
+    if 'user_id' not in session:
+        return jsonify({'error': 'Not authenticated'}), 401
+    
+    if session_id not in interview_sessions:
+        return jsonify({'error': 'Session not found'}), 404
+    
+    sess = interview_sessions[session_id]
+    sess['tab_switches'] += 1
+    sess['warning_count'] = sess.get('warning_count', 0) + 1
+    
+    # Log the event
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        INSERT INTO tracking_events (session_id, event_type, details)
+        VALUES (?, 'tab_switch', ?)
+    ''', (session_id, f"Tab switch #{sess['tab_switches']}"))
+    conn.commit()
+    conn.close()
+    
+    warning_count = sess['warning_count']
+    
+    # 3-strike system
+    if warning_count >= 3:
+        # Terminate interview and ban user for 24 hours
+        terminate_interview(session_id, 'Too many tab switches (3 strikes)')
+        
+        # Ban user for 24 hours
+        ban_until = datetime.now() + timedelta(hours=24)
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('''
+            INSERT INTO user_violations (user_id, violation_type, ban_until)
+            VALUES (?, 'tab_switching', ?)
+        ''', (sess['user_id'], ban_until))
+        conn.commit()
+        conn.close()
+        
+        return jsonify({
+            'terminated': True,
+            'reason': 'Too many tab switches',
+            'ban_until': ban_until.isoformat(),
+            'message': 'Interview terminated. You are banned from taking interviews for 24 hours.'
+        }), 403
+    
+    # Return warning
+    return jsonify({
+        'success': True,
+        'warning': True,
+        'warning_count': warning_count,
+        'total_switches': sess['tab_switches'],
+        'remaining_warnings': 3 - warning_count,
+        'message': f"Warning {warning_count}/3: Please stay focused on the interview. {3 - warning_count} warning(s) remaining."
+    })
+
+@app.route('/api/get-results/<session_id>', methods=['GET'])
+def get_results(session_id):
+    """Get interview results with dynamic report"""
+    if 'user_id' not in session:
+        return jsonify({'error': 'Not authenticated'}), 401
+    
+    if session_id not in interview_sessions:
+        return jsonify({'error': 'Session not found'}), 404
+    
+    sess = interview_sessions[session_id]
+    
+    # Generate dynamic report based on answers
+    report = generate_dynamic_report(sess)
+    
+    return jsonify({
+        'role': sess['role'],
+        'category': sess['category'],
+        'difficulty': sess['difficulty'],
+        'total_questions': len(sess['questions']),
+        'total_answered': len(sess['answers']),
+        'tab_switches': sess['tab_switches'],
+        'answers': sess['answers'],
+        'start_time': sess['start_time'],
+        'report': report
+    })
+
+def generate_dynamic_report(session_data):
+    """Generate a dynamic report based on user's answers"""
+    answers = session_data['answers']
+    total = len(session_data['questions'])
+    answered = len([a for a in answers if a['answer'] != '[Skipped]'])
+    skipped = total - answered
+    
+    # Calculate average answer length
+    answer_lengths = [len(a['answer']) for a in answers if a['answer'] != '[Skipped]']
+    avg_length = sum(answer_lengths) / len(answer_lengths) if answer_lengths else 0
+    
+    # Determine performance level
+    completion_rate = (answered / total) * 100
+    
+    if completion_rate >= 90 and avg_length > 100:
+        performance = "Excellent"
+        feedback = "Outstanding performance! You answered most questions with detailed responses."
+    elif completion_rate >= 70 and avg_length > 50:
+        performance = "Good"
+        feedback = "Good job! You provided solid answers to most questions."
+    elif completion_rate >= 50:
+        performance = "Fair"
+        feedback = "Fair performance. Consider providing more detailed answers."
+    else:
+        performance = "Needs Improvement"
+        feedback = "You skipped many questions. Try to answer more completely next time."
+    
+    # Tab switching warning
+    tab_warning = ""
+    if session_data['tab_switches'] > 0:
+        tab_warning = f"⚠️ Warning: You switched tabs {session_data['tab_switches']} time(s) during the interview."
+    
+    return {
+        'performance': performance,
+        'completion_rate': round(completion_rate, 1),
+        'answered': answered,
+        'skipped': skipped,
+        'avg_answer_length': round(avg_length, 1),
+        'feedback': feedback,
+        'tab_warning': tab_warning,
+        'strengths': analyze_strengths(answers),
+        'recommendations': generate_recommendations(session_data)
+    }
+
+def analyze_strengths(answers):
+    """Analyze user's strengths based on answers"""
+    strengths = []
+    
+    detailed_answers = [a for a in answers if len(a['answer']) > 150]
+    if len(detailed_answers) > len(answers) * 0.5:
+        strengths.append("Provides detailed, comprehensive answers")
+    
+    quick_responses = []
+    for i in range(1, len(answers)):
+        prev_time = datetime.fromisoformat(answers[i-1]['timestamp'])
+        curr_time = datetime.fromisoformat(answers[i]['timestamp'])
+        if (curr_time - prev_time).seconds < 120:
+            quick_responses.append(i)
+    
+    if len(quick_responses) > len(answers) * 0.3:
+        strengths.append("Quick thinking and response time")
+    
+    if not any(a['answer'] == '[Skipped]' for a in answers):
+        strengths.append("Complete participation - no questions skipped")
+    
+    return strengths if strengths else ["Completed the interview"]
+
+def generate_recommendations(session_data):
+    """Generate personalized recommendations"""
+    recommendations = []
+    
+    skipped = len([a for a in session_data['answers'] if a['answer'] == '[Skipped]'])
+    if skipped > 0:
+        recommendations.append("Try to answer all questions, even if briefly")
+    
+    if session_data['tab_switches'] > 0:
+        recommendations.append("Stay focused - avoid switching tabs during interviews")
+    
+    avg_length = sum(len(a['answer']) for a in session_data['answers']) / len(session_data['answers'])
+    if avg_length < 50:
+        recommendations.append("Provide more detailed answers to demonstrate your knowledge")
+    
+    if session_data['category'] == 'Technical':
+        recommendations.append("Practice more technical concepts and coding problems")
+    else:
+        recommendations.append("Prepare more behavioral examples using the STAR method")
+    
+    return recommendations
+
+@app.route('/api/user-stats', methods=['GET'])
+def user_stats():
+    """Get user statistics"""
+    if 'user_id' not in session:
+        return jsonify({'error': 'Not authenticated'}), 401
+    
+    user_id = session['user_id']
+    limits = can_start_interview(user_id)
+    
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    # Get completed interviews
+    c.execute('''
+        SELECT COUNT(*) FROM interview_sessions 
+        WHERE user_id = ? AND completed = 1
+    ''', (user_id,))
+    completed = c.fetchone()[0]
+    
+    conn.close()
+    
+    return jsonify({
+        'username': session['username'],
+        'total_interviews': limits['total_interviews'],
+        'completed_interviews': completed,
+        'interviews_last_24h': limits['interviews_last_24h'],
+        'remaining_24h': limits['remaining_24h'],
+        'remaining_total': limits['remaining_total'],
+        'can_start': limits['can_start']
+    })
+
+@app.route('/api/track-event/<session_id>', methods=['POST'])
+def track_event(session_id):
+    """Track various monitoring events (posture, eye movement, etc.)"""
+    if 'user_id' not in session:
+        return jsonify({'error': 'Not authenticated'}), 401
+    
+    if session_id not in interview_sessions:
+        return jsonify({'error': 'Session not found'}), 404
+    
+    data = request.json
+    event_type = data.get('event_type')  # 'posture_violation', 'eye_wander', 'focus_loss', etc.
+    details = data.get('details', '')
+    
+    # Log to database
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        INSERT INTO tracking_events (session_id, event_type, details)
+        VALUES (?, ?, ?)
+    ''', (session_id, event_type, details))
+    conn.commit()
+    conn.close()
+    
+    # Update session metrics
+    sess = interview_sessions[session_id]
+    if event_type == 'posture_violation':
+        sess['posture_violations'] = sess.get('posture_violations', 0) + 1
+    
+    return jsonify({'success': True, 'event_logged': event_type})
+
+@app.route('/api/update-tracking-metrics/<session_id>', methods=['POST'])
+def update_tracking_metrics(session_id):
+    """Update tracking metrics (eye tracking score, focus percentage)"""
+    if 'user_id' not in session:
+        return jsonify({'error': 'Not authenticated'}), 401
+    
+    if session_id not in interview_sessions:
+        return jsonify({'error': 'Session not found'}), 404
+    
+    data = request.json
+    eye_tracking_score = data.get('eye_tracking_score', 0)
+    focus_percentage = data.get('focus_percentage', 0)
+    
+    # Update in-memory session
+    sess = interview_sessions[session_id]
+    sess['eye_tracking_score'] = eye_tracking_score
+    sess['focus_percentage'] = focus_percentage
+    
+    # Update database
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        UPDATE interview_sessions 
+        SET eye_tracking_score = ?, focus_percentage = ?, posture_violations = ?
+        WHERE session_id = ?
+    ''', (eye_tracking_score, focus_percentage, sess.get('posture_violations', 0), session_id))
+    conn.commit()
+    conn.close()
+    
+    return jsonify({'success': True})
+
+
+@app.route('/api/generate-report/<session_id>', methods=['GET'])
+def generate_report(session_id):
+    """Generate and download PDF report"""
+    if 'user_id' not in session:
+        return jsonify({'error': 'Not authenticated'}), 401
+    
+    try:
+        # Get session data
+        if session_id not in interview_sessions:
+            return jsonify({'error': 'Session not found'}), 404
+        
+        sess = interview_sessions[session_id]
+        
+        # Verify session belongs to user
+        if sess['user_id'] != session['user_id']:
+            return jsonify({'error': 'Unauthorized'}), 403
+        
+        # Get user info
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('SELECT username FROM users WHERE id = ?', (sess['user_id'],))
+        user = c.fetchone()
+        conn.close()
+        
+        # Prepare session data for report
+        report_data = {
+            'username': user[0] if user else 'Unknown',
+            'role': sess['role'],
+            'category': sess['category'],
+            'total_questions': len(sess['questions']),
+            'questions': sess['questions'],
+            'answers': sess['answers'],
+            'scores': [],
+            'duration': 0,
+            'tracking_data': {
+                'posture_score': sess.get('posture_score', 0),
+                'eye_contact': sess.get('eye_contact', 0),
+                'focus': sess.get('focus', 0),
+                'tab_switches': sess.get('tab_switches', 0)
+            }
+        }
+        
+        # Calculate duration
+        if 'start_time' in sess:
+            start = datetime.fromisoformat(sess['start_time'])
+            end = datetime.now()
+            duration_minutes = (end - start).total_seconds() / 60
+            report_data['duration'] = round(duration_minutes, 1)
+        
+        # Generate PDF
+        generator = InterviewReportGenerator()
+        
+        # Create reports directory
+        reports_dir = 'reports'
+        if not os.path.exists(reports_dir):
+            os.makedirs(reports_dir)
+        
+        # Generate PDF file
+        filename = f"interview_report_{session['user_id']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+        filepath = os.path.join(reports_dir, filename)
+        
+        generator.generate_pdf_report(report_data, filepath)
+        
+        # Send file
+        return send_file(
+            filepath,
+            mimetype='application/pdf',
+            as_attachment=True,
+            download_name=f"Interview_Report_{report_data['username']}.pdf"
+        )
+        
+    except Exception as e:
+        print(f"[ERROR] Report generation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': f'Failed to generate report: {str(e)}'}), 500
+
+
+if __name__ == '__main__':
+    print("\n" + "=" * 60)
+    print("ENHANCED INTERVIEW SYSTEM SERVER")
+    print("=" * 60)
+    print("\nServer starting on http://localhost:5000")
+    print("   Features:")
+    print("   [OK] User Authentication")
+    print("   [OK] Interview Limits (2/24h, 5 total)")
+    print("   [OK] Tab Switching Detection (3-strike system)")
+    print("   [OK] Body Posture Tracking")
+    print("   [OK] Eye Movement Tracking")
+    print("   [OK] Voice Recognition")
+    print("   [OK] Comprehensive Monitoring")
+    print("   [OK] Dynamic Report Generation")
+    print("\n" + "=" * 60 + "\n")
+    
+    app.run(debug=True, port=5000, host='0.0.0.0')

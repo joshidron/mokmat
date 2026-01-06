@@ -1,0 +1,13 @@
+# Add these routes to auth_app.py
+
+# After the existing routes, add:
+
+@app.route('/test-signin')
+def test_signin_page():
+    """Simple Google Sign-In test page"""
+    return render_template('test_google_signin.html')
+
+@app.route('/diagnostic')
+def diagnostic_page():
+    """Firebase diagnostic page"""
+    return render_template('firebase_diagnostic.html')

@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Firebase Configuration Helper</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+
+        .container {
+            background: white;
+            border-radius: 20px;
+            padding: 40px;
+            max-width: 800px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+        }
+
+        h1 {
+            color: #667eea;
+            margin-bottom: 10px;
+        }
+
+        .project-id {
+            background: #f0f0f0;
+            padding: 10px 15px;
+            border-radius: 8px;
+            margin-bottom: 30px;
+            font-family: monospace;
+            font-size: 16px;
+        }
+
+        .step {
+            margin-bottom: 30px;
+            padding: 20px;
+            background: #f9f9f9;
+            border-radius: 10px;
+            border-left: 4px solid #667eea;
+        }
+
+        .step h2 {
+            color: #333;
+            margin-bottom: 15px;
+            font-size: 18px;
+        }
+
+        .step p {
+            color: #666;
+            line-height: 1.6;
+            margin-bottom: 10px;
+        }
+
+        .step a {
+            color: #667eea;
+            text-decoration: none;
+            font-weight: 600;
+        }
+
+        .step a:hover {
+            text-decoration: underline;
+        }
+
+        .code-block {
+            background: #2d2d2d;
+            color: #f8f8f2;
+            padding: 15px;
+            border-radius: 8px;
+            margin: 15px 0;
+            overflow-x: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 14px;
+        }
+
+        .highlight {
+            background: #ffeb3b;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-weight: 600;
+        }
+
+        .btn {
+            background: #667eea;
+            color: white;
+            padding: 12px 30px;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-block;
+            margin-top: 10px;
+        }
+
+        .btn:hover {
+            background: #5568d3;
+        }
+
+        .success {
+            background: #4caf50;
+            color: white;
+            padding: 15px;
+            border-radius: 8px;
+            margin-top: 20px;
+        }
+
+        .warning {
+            background: #ff9800;
+            color: white;
+            padding: 15px;
+            border-radius: 8px;
+            margin-top: 20px;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <h1>🔥 Firebase Configuration Helper</h1>
+        <div class="project-id">
+            Project: <strong>mokmat-c3474</strong>
+        </div>
+
+        <div class="step">
+            <h2>Step 1: Get Your Firebase Configuration</h2>
+            <p>Click the button below to open your Firebase project settings:</p>
+            <a href="https://console.firebase.google.com/project/mokmat-c3474/settings/general" target="_blank"
+                class="btn">
+                Open Firebase Settings
+            </a>
+            <p style="margin-top: 15px;">
+                Scroll down to <span class="highlight">"Your apps"</span> section and look for your web app
+                configuration.
+            </p>
+        </div>
+
+        <div class="step">
+            <h2>Step 2: Copy Your Configuration</h2>
+            <p>You should see a code snippet like this:</p>
+            <div class="code-block">
+                const firebaseConfig = {
+                apiKey: "AIzaSy...",
+                authDomain: "mokmat-c3474.firebaseapp.com",
+                projectId: "mokmat-c3474",
+                storageBucket: "mokmat-c3474.appspot.com",
+                messagingSenderId: "123456789",
+                appId: "1:123456789:web:abc123",
+                measurementId: "G-ABC123"
+                };
+            </div>
+            <p><strong>Copy all the values</strong> from your Firebase console.</p>
+        </div>
+
+        <div class="step">
+            <h2>Step 3: Update Your Configuration File</h2>
+            <p>Open the file: <code>static/js/firebase_auth.js</code></p>
+            <p>Replace lines 7-14 with your actual values:</p>
+            <div class="code-block">
+                const firebaseConfig = {
+                apiKey: "YOUR_ACTUAL_API_KEY_HERE",
+                authDomain: "mokmat-c3474.firebaseapp.com",
+                projectId: "mokmat-c3474",
+                storageBucket: "mokmat-c3474.appspot.com",
+                messagingSenderId: "YOUR_ACTUAL_SENDER_ID",
+                appId: "YOUR_ACTUAL_APP_ID",
+                measurementId: "YOUR_ACTUAL_MEASUREMENT_ID"
+                };
+            </div>
+        </div>
+
+        <div class="step">
+            <h2>Step 4: Enable Google Authentication</h2>
+            <p>Click the button below to enable Google Sign-In:</p>
+            <a href="https://console.firebase.google.com/project/mokmat-c3474/authentication/providers" target="_blank"
+                class="btn">
+                Enable Google Sign-In
+            </a>
+            <p style="margin-top: 15px;">
+                1. Click on <span class="highlight">"Google"</span> provider<br>
+                2. Toggle <span class="highlight">"Enable"</span><br>
+                3. Select your support email<br>
+                4. Click <span class="highlight">"Save"</span>
+            </p>
+        </div>
+
+        <div class="step">
+            <h2>Step 5: Create Firestore Database</h2>
+            <p>Click the button below to create your database:</p>
+            <a href="https://console.firebase.google.com/project/mokmat-c3474/firestore" target="_blank" class="btn">
+                Create Firestore Database
+            </a>
+            <p style="margin-top: 15px;">
+                1. Click <span class="highlight">"Create database"</span><br>
+                2. Select <span class="highlight">"Start in test mode"</span><br>
+                3. Choose location (e.g., asia-south1 for India)<br>
+                4. Click <span class="highlight">"Enable"</span>
+            </p>
+        </div>
+
+        <div class="step">
+            <h2>Step 6: Add Authorized Domain</h2>
+            <p>Add localhost to authorized domains:</p>
+            <a href="https://console.firebase.google.com/project/mokmat-c3474/authentication/settings" target="_blank"
+                class="btn">
+                Add Authorized Domains
+            </a>
+            <p style="margin-top: 15px;">
+                1. Go to <span class="highlight">"Authorized domains"</span> tab<br>
+                2. Add: <code>localhost</code><br>
+                3. Click <span class="highlight">"Add domain"</span>
+            </p>
+        </div>
+
+        <div class="success">
+            <strong>✅ After completing all steps:</strong><br>
+            1. Save your changes to <code>firebase_auth.js</code><br>
+            2. Run: <code>python auth_app.py</code><br>
+            3. Open: <code>http://localhost:5000/login</code><br>
+            4. Click "Continue with Google" to test!
+        </div>
+
+        <div class="warning">
+            <strong>⚠️ Important:</strong><br>
+            Make sure to replace ALL placeholder values (apiKey, messagingSenderId, appId, measurementId) with your
+            actual Firebase credentials!
+        </div>
+    </div>
+</body>
+
+</html>

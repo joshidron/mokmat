@@ -1,0 +1,84 @@
+# Add this to auth_app.py after the other imports
+
+from flask import send_file
+from report_generator import InterviewReportGenerator
+import io
+
+# Add this route after the other API routes
+
+@app.route('/api/generate-report/<session_id>', methods=['GET'])
+def generate_report(session_id):
+    """Generate and download PDF report"""
+    if 'user_id' not in session:
+        return jsonify({'error': 'Not authenticated'}), 401
+    
+    try:
+        # Get session data
+        if session_id not in interview_sessions:
+            return jsonify({'error': 'Session not found'}), 404
+        
+        sess = interview_sessions[session_id]
+        
+        # Verify session belongs to user
+        if sess['user_id'] != session['user_id']:
+            return jsonify({'error': 'Unauthorized'}), 403
+        
+        # Get user info
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('SELECT username FROM users WHERE id = ?', (sess['user_id'],))
+        user = c.fetchone()
+        conn.close()
+        
+        # Prepare session data for report
+        report_data = {
+            'username': user[0] if user else 'Unknown',
+            'role': sess['role'],
+            'category': sess['category'],
+            'total_questions': len(sess['questions']),
+            'questions': sess['questions'],
+            'answers': sess['answers'],
+            'scores': [],  # Will be calculated by report generator
+            'duration': 0,  # Calculate from timestamps
+            'tracking_data': {
+                'posture_score': sess.get('posture_score', 0),
+                'eye_contact': sess.get('eye_contact', 0),
+                'focus': sess.get('focus', 0),
+                'tab_switches': sess.get('tab_switches', 0)
+            }
+        }
+        
+        # Calculate duration
+        if 'start_time' in sess:
+            start = datetime.fromisoformat(sess['start_time'])
+            end = datetime.now()
+            duration_minutes = (end - start).total_seconds() / 60
+            report_data['duration'] = round(duration_minutes, 1)
+        
+        # Generate PDF
+        generator = InterviewReportGenerator()
+        
+        # Create reports directory if it doesn't exist
+        reports_dir = 'reports'
+        if not os.path.exists(reports_dir):
+            os.makedirs(reports_dir)
+        
+        # Generate PDF file
+        filename = f"interview_report_{session['user_id']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+        filepath = os.path.join(reports_dir, filename)
+        
+        generator.generate_pdf_report(report_data, filepath)
+        
+        # Send file
+        return send_file(
+            filepath,
+            mimetype='application/pdf',
+            as_attachment=True,
+            download_name=f"Interview_Report_{report_data['username']}.pdf"
+        )
+        
+    except Exception as e:
+        print(f"[ERROR] Report generation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': f'Failed to generate report: {str(e)}'}), 500
